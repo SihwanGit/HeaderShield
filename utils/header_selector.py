@@ -16,6 +16,7 @@ class RuleBasedHeaderSelector:
     ):
         """
         Rule-based Header Selector
+        룰 기반 헤더 셀렉터 코드
 
         발화 시작 구간의 간단한 음향 특징을 기반으로 Header Bank에서 사용할 header index를 선택한다.
 
