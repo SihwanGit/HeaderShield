@@ -1,6 +1,6 @@
 import os
 import argparse
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 
 import torch
 import torch.nn as nn
@@ -119,16 +119,132 @@ def compute_header_bank_loss(source_mel: torch.Tensor,
     return loss
 
 
+def add_header_weight(plan: Dict[int, float],
+                      header_index: int,
+                      weight: float,
+                      num_headers: int) -> None:
+    """
+    학습 계획(plan)에 header index와 loss weight를 추가한다.
+    이미 같은 header가 들어있으면 weight를 누적한다.
+
+    Args:
+        plan: {header_index: weight}
+        header_index: 학습할 header 번호
+        weight: 해당 header loss 가중치
+        num_headers: 전체 header 개수
+    """
+    if weight <= 0:
+        return
+
+    if header_index < 0:
+        header_index = 0
+
+    if header_index >= num_headers:
+        header_index = num_headers - 1
+
+    if header_index not in plan:
+        plan[header_index] = 0.0
+
+    plan[header_index] += weight
+
+
+def build_header_training_plan(selected_header_index: int,
+                               total_steps: int,
+                               args) -> List[Tuple[int, float]]:
+    """
+    현재 step에서 어떤 header들을 학습할지 결정한다.
+
+    training_strategy:
+        selected_only:
+            selector가 고른 header만 학습한다.
+            기존 train_header_bank.py와 같은 방식이다.
+
+        cycle_only:
+            selector 결과와 무관하게 header를 0,1,2,3,4 순서로 강제 순환 학습한다.
+            데이터가 부족해도 모든 header가 업데이트되도록 하는 방식이다.
+
+        hybrid:
+            selector가 고른 header를 가장 강하게 학습하고,
+            default header 0과 cycle header를 보조적으로 함께 학습한다.
+            방법2 + 방법3을 결합한 안정화 방식이다.
+
+    Returns:
+        [(header_index, weight), ...]
+    """
+    plan: Dict[int, float] = {}
+
+    cycle_header_index = total_steps % args.num_headers
+
+    if args.training_strategy == "selected_only":
+        add_header_weight(
+            plan=plan,
+            header_index=selected_header_index,
+            weight=1.0,
+            num_headers=args.num_headers
+        )
+
+    elif args.training_strategy == "cycle_only":
+        add_header_weight(
+            plan=plan,
+            header_index=cycle_header_index,
+            weight=1.0,
+            num_headers=args.num_headers
+        )
+
+    elif args.training_strategy == "hybrid":
+        # 1. selector가 고른 header를 가장 강하게 학습한다.
+        add_header_weight(
+            plan=plan,
+            header_index=selected_header_index,
+            weight=args.selected_header_weight,
+            num_headers=args.num_headers
+        )
+
+        # 2. default header 0을 fallback header로 함께 학습한다.
+        if args.enable_default_update:
+            add_header_weight(
+                plan=plan,
+                header_index=0,
+                weight=args.default_header_weight,
+                num_headers=args.num_headers
+            )
+
+        # 3. 모든 header가 최소한 주기적으로 학습되도록 cycle header를 함께 학습한다.
+        if args.enable_cycle_update:
+            add_header_weight(
+                plan=plan,
+                header_index=cycle_header_index,
+                weight=args.cycle_header_weight,
+                num_headers=args.num_headers
+            )
+
+    else:
+        raise ValueError(f"지원하지 않는 training_strategy입니다: {args.training_strategy}")
+
+    return sorted(plan.items(), key=lambda x: x[0])
+
+
 def train_header_bank(speaker_encoder: nn.Module, args) -> None:
     """
     Selector 기반 Header Bank 학습.
 
-    학습 방식:
+    기존 방식:
         1. source waveform의 발화 시작 구간을 selector로 분석
         2. selector가 header index 선택
-        3. Header Bank에서 해당 index의 header만 source mel 앞부분에 적용
-        4. speaker loss 계산
-        5. 선택된 header에 gradient가 흐르도록 업데이트
+        3. 선택된 header만 source mel 앞부분에 적용
+        4. 선택된 header만 업데이트
+
+    수정된 방식:
+        selected_only:
+            기존 방식과 동일하게 selector가 고른 header만 학습한다.
+
+        cycle_only:
+            모든 header가 최소한 한 번씩 학습되도록 header index를 순환시킨다.
+
+        hybrid:
+            selector가 고른 header를 중심으로 학습하되,
+            default header 0과 cycle header를 함께 업데이트하여
+            데이터 부족 상황에서도 특정 header가 미학습 상태로 남는 문제를 완화한다.
 
     Header index 의미:
         0: default
@@ -140,16 +256,22 @@ def train_header_bank(speaker_encoder: nn.Module, args) -> None:
     print("Selector 기반 Header Bank 학습을 시작합니다...")
 
     print("[설정 확인]")
-    print(f"  data_dir        : {args.data_dir}")
-    print(f"  target_speaker : {args.target_speaker}")
-    print(f"  other_speakers : {args.other_speakers}")
-    print(f"  num_headers    : {args.num_headers}")
-    print(f"  sample_rate    : {args.sample_rate}")
-    print(f"  window_size    : {args.window_size} samples ({args.window_size / args.sample_rate:.3f} sec)")
-    print(f"  shift_size     : {args.shift_size} samples ({args.shift_size / args.sample_rate:.3f} sec)")
-    print(f"  hop_length     : {args.hop_length} samples")
-    print(f"  header_length  : {args.header_length} mel frames ({args.header_length * args.hop_length / args.sample_rate:.3f} sec)")
-    print(f"  device         : {args.device}")
+    print(f"  data_dir              : {args.data_dir}")
+    print(f"  target_speaker        : {args.target_speaker}")
+    print(f"  other_speakers        : {args.other_speakers}")
+    print(f"  num_headers           : {args.num_headers}")
+    print(f"  sample_rate           : {args.sample_rate}")
+    print(f"  window_size           : {args.window_size} samples ({args.window_size / args.sample_rate:.3f} sec)")
+    print(f"  shift_size            : {args.shift_size} samples ({args.shift_size / args.sample_rate:.3f} sec)")
+    print(f"  hop_length            : {args.hop_length} samples")
+    print(f"  header_length         : {args.header_length} mel frames ({args.header_length * args.hop_length / args.sample_rate:.3f} sec)")
+    print(f"  device                : {args.device}")
+    print(f"  training_strategy     : {args.training_strategy}")
+    print(f"  selected_header_weight: {args.selected_header_weight}")
+    print(f"  enable_default_update : {args.enable_default_update}")
+    print(f"  default_header_weight : {args.default_header_weight}")
+    print(f"  enable_cycle_update   : {args.enable_cycle_update}")
+    print(f"  cycle_header_weight   : {args.cycle_header_weight}")
 
     train_loader, _ = get_dataloaders(
         args.data_dir,
@@ -192,7 +314,14 @@ def train_header_bank(speaker_encoder: nn.Module, args) -> None:
     speaker_encoder = speaker_encoder.to(args.device)
     freeze_model(speaker_encoder)
 
+    # selector가 실제로 어떤 header를 선택했는지 기록
+    selector_selected_counts: Dict[int, int] = {idx: 0 for idx in range(args.num_headers)}
+
+    # optimizer step에서 실제로 어떤 header가 학습되었는지 기록
     header_update_counts: Dict[int, int] = {idx: 0 for idx in range(args.num_headers)}
+
+    # loss weight까지 반영한 누적 학습량 기록
+    header_weighted_update_counts: Dict[int, float] = {idx: 0.0 for idx in range(args.num_headers)}
 
     total_steps = 0
 
@@ -213,15 +342,20 @@ def train_header_bank(speaker_encoder: nn.Module, args) -> None:
                 single_source_waveform = source_waveform[i]
                 single_target_waveform = target_waveform[i]
 
-                # 수정: selector는 waveform 시작 구간을 보고 header index를 결정한다.
-                header_index, features = selector.select(
+                # selector는 waveform 시작 구간을 보고 header index를 결정한다.
+                selected_header_index, features = selector.select(
                     single_source_waveform.detach().cpu(),
                     return_features=True
                 )
 
-                # 수정: HeaderBank의 num_headers보다 큰 index가 선택될 가능성을 방어
-                if header_index >= args.num_headers:
-                    header_index = args.num_headers - 1
+                # HeaderBank의 num_headers보다 큰 index가 선택될 가능성을 방어
+                if selected_header_index >= args.num_headers:
+                    selected_header_index = args.num_headers - 1
+
+                if selected_header_index < 0:
+                    selected_header_index = 0
+
+                selector_selected_counts[selected_header_index] += 1
 
                 source_mel = converter.waveform_to_mel(single_source_waveform).unsqueeze(0)
                 target_mel = converter.waveform_to_mel(single_target_waveform).unsqueeze(0)
@@ -235,23 +369,48 @@ def train_header_bank(speaker_encoder: nn.Module, args) -> None:
                 if source_mel.shape[-1] == 0 or target_mel.shape[-1] == 0:
                     continue
 
-                # 수정: selector가 고른 header만 source_mel 앞부분에 적용한다.
-                # PyTorch indexing 특성상 선택된 header slice에만 gradient가 흐른다.
-                perturbed_mel = header_bank.apply_header(source_mel, header_index)
-
-                loss = compute_header_bank_loss(
-                    source_mel=source_mel,
-                    target_mel=target_mel,
-                    perturbed_mel=perturbed_mel,
-                    speaker_encoder=speaker_encoder,
-                    lambda_param=args.lambda_param
+                # 현재 step에서 학습할 header 목록을 만든다.
+                # hybrid 전략에서는 selected header + default header + cycle header가 함께 들어갈 수 있다.
+                training_plan = build_header_training_plan(
+                    selected_header_index=selected_header_index,
+                    total_steps=total_steps,
+                    args=args
                 )
+
+                if len(training_plan) == 0:
+                    raise RuntimeError("학습할 header가 없습니다. training_strategy 설정을 확인하세요.")
+
+                weighted_losses = []
+                loss_detail_items = []
+
+                for train_header_index, weight in training_plan:
+                    # HeaderBank.apply_header가 int index를 받는 구조를 유지한다.
+                    perturbed_mel = header_bank.apply_header(source_mel, train_header_index)
+
+                    header_loss = compute_header_bank_loss(
+                        source_mel=source_mel,
+                        target_mel=target_mel,
+                        perturbed_mel=perturbed_mel,
+                        speaker_encoder=speaker_encoder,
+                        lambda_param=args.lambda_param
+                    )
+
+                    weighted_losses.append(header_loss * weight)
+                    loss_detail_items.append(f"h{train_header_index}:w{weight:.2f}:loss{header_loss.item():.4f}")
+
+                    header_update_counts[train_header_index] += 1
+                    header_weighted_update_counts[train_header_index] += weight
+
+                total_weight = sum(weight for _, weight in training_plan)
+
+                # step마다 학습되는 header 개수나 weight 합이 달라질 수 있으므로 weight 합으로 나눠 loss scale을 안정화한다.
+                loss = torch.stack(weighted_losses).sum() / total_weight
 
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
 
-                # 수정: Header Bank 전체 perturbation 크기를 epsilon 범위로 제한한다.
+                # Header Bank 전체 perturbation 크기를 epsilon 범위로 제한한다.
                 with torch.no_grad():
                     header_bank.headers.data = torch.clamp(
                         header_bank.headers.data,
@@ -262,16 +421,21 @@ def train_header_bank(speaker_encoder: nn.Module, args) -> None:
                 epoch_loss += loss.item()
                 epoch_updates += 1
                 total_steps += 1
-                header_update_counts[header_index] += 1
 
                 if total_steps % args.log_interval == 0:
+                    energy = features.get("energy", 0.0)
+                    zcr = features.get("zero_crossing_rate", 0.0)
+                    centroid = features.get("spectral_centroid", 0.0)
+
                     print(
                         f"[step {total_steps}] "
                         f"loss={loss.item():.6f}, "
-                        f"header_index={header_index}, "
-                        f"energy={features['energy']:.6f}, "
-                        f"zcr={features['zero_crossing_rate']:.6f}, "
-                        f"centroid={features['spectral_centroid']:.2f}"
+                        f"selected_header={selected_header_index}, "
+                        f"train_plan={training_plan}, "
+                        f"energy={energy:.6f}, "
+                        f"zcr={zcr:.6f}, "
+                        f"centroid={centroid:.2f}, "
+                        f"details={' | '.join(loss_detail_items)}"
                     )
 
             if total_steps >= args.max_steps:
@@ -292,9 +456,17 @@ def train_header_bank(speaker_encoder: nn.Module, args) -> None:
         avg_loss = epoch_loss / epoch_updates
         print(f"Epoch {epoch + 1}/{args.epochs}, Avg Loss: {avg_loss:.6f}")
 
+        print("[Selector selected counts]")
+        for idx in range(args.num_headers):
+            print(f"  header {idx}: {selector_selected_counts[idx]} selected")
+
         print("[Header update counts]")
         for idx in range(args.num_headers):
             print(f"  header {idx}: {header_update_counts[idx]} updates")
+
+        print("[Header weighted update counts]")
+        for idx in range(args.num_headers):
+            print(f"  header {idx}: {header_weighted_update_counts[idx]:.2f} weighted updates")
 
         if (epoch + 1) % args.save_interval == 0:
             os.makedirs(args.output_dir, exist_ok=True)
@@ -307,9 +479,18 @@ def train_header_bank(speaker_encoder: nn.Module, args) -> None:
     header_bank.save(final_path)
 
     print(f"최종 Header Bank가 저장되었습니다: {final_path}")
+
+    print("[최종 Selector selected counts]")
+    for idx in range(args.num_headers):
+        print(f"  header {idx}: {selector_selected_counts[idx]} selected")
+
     print("[최종 Header update counts]")
     for idx in range(args.num_headers):
         print(f"  header {idx}: {header_update_counts[idx]} updates")
+
+    print("[최종 Header weighted update counts]")
+    for idx in range(args.num_headers):
+        print(f"  header {idx}: {header_weighted_update_counts[idx]:.2f} weighted updates")
 
 
 def main():
@@ -363,6 +544,21 @@ def main():
     parser.add_argument("--num_workers", type=int, default=0,
                         help="데이터 로딩 worker 수. WSL/CPU 디버깅에서는 0 권장")
 
+    # Header Bank 학습 전략 인자
+    parser.add_argument("--training_strategy", type=str, default="hybrid",
+                        choices=["selected_only", "cycle_only", "hybrid"],
+                        help="Header Bank 학습 전략. selected_only는 기존 방식, cycle_only는 순환 학습, hybrid는 선택 header+default+cycle 결합")
+    parser.add_argument("--selected_header_weight", type=float, default=1.0,
+                        help="hybrid 전략에서 selector가 고른 header의 loss 가중치")
+    parser.add_argument("--enable_default_update", action="store_true",
+                        help="hybrid 전략에서 default header 0을 함께 업데이트할지 여부")
+    parser.add_argument("--default_header_weight", type=float, default=0.3,
+                        help="default header 0을 함께 학습할 때의 loss 가중치")
+    parser.add_argument("--enable_cycle_update", action="store_true",
+                        help="hybrid 전략에서 cycle header를 함께 업데이트할지 여부")
+    parser.add_argument("--cycle_header_weight", type=float, default=0.5,
+                        help="cycle header를 함께 학습할 때의 loss 가중치")
+
     # selector 인자
     parser.add_argument("--analysis_duration", type=float, default=0.3,
                         help="selector가 분석할 발화 시작 구간 길이. 초 단위")
@@ -390,6 +586,15 @@ def main():
     if args.device == "cuda" and not torch.cuda.is_available():
         print("CUDA를 사용할 수 없습니다. device를 cpu로 변경합니다.")
         args.device = "cpu"
+
+    # hybrid 전략에서는 기본적으로 default update와 cycle update를 켜는 것이 목적에 맞다.
+    # argparse의 action="store_true"는 명령어에 옵션을 넣어야 True가 되므로,
+    # 사용자가 selected_only나 cycle_only를 쓰지 않는 경우에는 안전하게 True로 보정한다.
+    if args.training_strategy == "hybrid":
+        if not args.enable_default_update:
+            args.enable_default_update = True
+        if not args.enable_cycle_update:
+            args.enable_cycle_update = True
 
     # TODO: 여기서는 목표 음성 합성 모델의 화자 인코더를 로드해야 함
     # 아래 코드는 예시이며, 실제 적용 시에는 실제 인코더를 로드해야 함

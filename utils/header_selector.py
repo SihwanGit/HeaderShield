@@ -219,6 +219,8 @@ class RuleBasedHeaderSelector:
 
         return 0
 
+
+    # rule 기반 셀렉트
     def select(self, waveform: torch.Tensor, return_features: bool = False):
         """
         header index를 선택한다.
@@ -236,6 +238,7 @@ class RuleBasedHeaderSelector:
         zcr = features["zero_crossing_rate"]
         centroid = features["spectral_centroid"]
 
+        # 각 zero_crossing rate, centroid, RMS energy 3가지 지표의 값을 이용해 헤더 인덱스 선택
         if zcr >= self.noisy_zcr_threshold:
             header_index = 4
         elif centroid >= self.high_centroid_threshold and zcr >= self.high_zcr_threshold:
