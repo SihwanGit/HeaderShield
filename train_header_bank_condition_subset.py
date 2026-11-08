@@ -13,6 +13,7 @@ from data.dataset import get_dataloaders
 from models.header_bank import HeaderBank
 from utils.audio import MelSpectrogramConverter
 from utils.header_selector import RuleBasedHeaderSelector
+from utils.header_training_log import HeaderTrainingLog, slice_metadata
 
 
 def move_converter_to_device(converter: MelSpectrogramConverter, device: str) -> MelSpectrogramConverter:
@@ -345,7 +346,7 @@ def compute_condition_aware_header_loss(source_mel: torch.Tensor,
 
 def build_condition_subsets(train_loader,
                             selector: RuleBasedHeaderSelector,
-                            args) -> Tuple[Dict[int, List[Dict[str, Any]]], List[Dict[str, Any]], Dict[int, int]]:
+                            args, training_log=None) -> Tuple[Dict[int, List[Dict[str, Any]]], List[Dict[str, Any]], Dict[int, int]]:
     """
     학습 전에 전체 데이터셋의 발화 시작 구간을 분석하고 header 조건별 subset을 만든다.
 
@@ -378,7 +379,11 @@ def build_condition_subsets(train_loader,
                 single_source_waveform,
                 return_features=True
             )
+            raw_header_index = header_index
             header_index = normalize_header_index(header_index, args.num_headers)
+            metadata = slice_metadata(batch, i, args.sample_rate)
+            if training_log is not None:
+                training_log.assignment(metadata, raw_header_index, header_index, features)
 
             normalized_features = {
                 "energy": safe_float(features.get("energy", 0.0)),
@@ -390,6 +395,7 @@ def build_condition_subsets(train_loader,
                 "source_waveform": single_source_waveform,
                 "target_waveform": single_target_waveform,
                 "assigned_header": header_index,
+                "metadata": metadata,
                 "features": normalized_features
             }
 
@@ -410,6 +416,8 @@ def build_condition_subsets(train_loader,
     for idx in range(args.num_headers):
         print(f"  header {idx}: {len(subsets[idx])} samples")
 
+    if training_log is not None:
+        training_log.summary("subset-built")
     return subsets, all_examples, selected_counts
 
 
@@ -533,10 +541,12 @@ def train_header_bank(speaker_encoder: nn.Module, args) -> None:
         noisy_zcr_threshold=args.noisy_zcr_threshold
     )
 
+    training_log = HeaderTrainingLog(args)
     subsets, all_examples, selector_selected_counts = build_condition_subsets(
         train_loader=train_loader,
         selector=selector,
-        args=args
+        args=args,
+        training_log=training_log
     )
 
     header_bank = HeaderBank(
@@ -559,6 +569,8 @@ def train_header_bank(speaker_encoder: nn.Module, args) -> None:
     total_steps = 0
 
     for epoch in range(args.epochs):
+        if total_steps >= args.max_steps:
+            break
         epoch_loss = 0.0
         epoch_updates = 0
 
@@ -622,6 +634,7 @@ def train_header_bank(speaker_encoder: nn.Module, args) -> None:
                     args=args
                 )
 
+                training_details = [(current_header_index, sample_weight, logs["total"], sample_type)]
                 weighted_losses.append(header_loss * sample_weight)
                 loss_detail_items.append(
                     f"h{current_header_index}:{sample_type}:w{sample_weight:.2f}:loss{logs['total']:.4f}"
@@ -644,6 +657,7 @@ def train_header_bank(speaker_encoder: nn.Module, args) -> None:
                         args=args
                     )
 
+                    training_details.append((0, args.default_header_weight, default_logs["total"], "default"))
                     weighted_losses.append(default_loss * args.default_header_weight)
                     loss_detail_items.append(
                         f"h0:default:w{args.default_header_weight:.2f}:loss{default_logs['total']:.4f}"
@@ -675,8 +689,11 @@ def train_header_bank(speaker_encoder: nn.Module, args) -> None:
                 epoch_loss += loss.item()
                 epoch_updates += 1
                 total_steps += 1
+                training_log.training(epoch + 1, total_steps, example["metadata"],
+                                      assigned_header, training_details, loss.item())
 
                 if total_steps % args.log_interval == 0:
+                    training_log.summary("progress", epoch + 1)
                     print(
                         f"[step {total_steps}] "
                         f"loss={loss.item():.6f}, "
@@ -701,6 +718,7 @@ def train_header_bank(speaker_encoder: nn.Module, args) -> None:
                 "- 논문 기준 실험이라면 --window_size 26400 이상을 사용하세요."
             )
 
+        training_log.summary("epoch-end", epoch + 1)
         avg_loss = epoch_loss / epoch_updates
         print(f"\nEpoch {epoch + 1}/{args.epochs}, Avg Loss: {avg_loss:.6f}")
 
@@ -730,6 +748,7 @@ def train_header_bank(speaker_encoder: nn.Module, args) -> None:
             print(f"Header Bank가 저장되었습니다: {save_path}")
 
     os.makedirs(args.output_dir, exist_ok=True)
+    training_log.summary("complete")
     final_path = os.path.join(args.output_dir, args.output_name)
     header_bank.save(final_path)
 

@@ -12,6 +12,7 @@ from data.dataset import get_dataloaders
 from models.header_bank import HeaderBank
 from utils.audio import MelSpectrogramConverter
 from utils.header_selector import RuleBasedHeaderSelector
+from utils.header_training_log import HeaderTrainingLog, slice_metadata
 
 
 def move_converter_to_device(converter: MelSpectrogramConverter, device: str) -> MelSpectrogramConverter:
@@ -323,9 +324,12 @@ def train_header_bank(speaker_encoder: nn.Module, args) -> None:
     # loss weight까지 반영한 누적 학습량 기록
     header_weighted_update_counts: Dict[int, float] = {idx: 0.0 for idx in range(args.num_headers)}
 
+    training_log = HeaderTrainingLog(args)
     total_steps = 0
 
     for epoch in range(args.epochs):
+        if total_steps >= args.max_steps:
+            break
         epoch_loss = 0.0
         epoch_updates = 0
 
@@ -348,6 +352,9 @@ def train_header_bank(speaker_encoder: nn.Module, args) -> None:
                     return_features=True
                 )
 
+                raw_header_index = selected_header_index
+                metadata = slice_metadata(batch, i, args.sample_rate)
+
                 # HeaderBank의 num_headers보다 큰 index가 선택될 가능성을 방어
                 if selected_header_index >= args.num_headers:
                     selected_header_index = args.num_headers - 1
@@ -356,6 +363,7 @@ def train_header_bank(speaker_encoder: nn.Module, args) -> None:
                     selected_header_index = 0
 
                 selector_selected_counts[selected_header_index] += 1
+                training_log.assignment(metadata, raw_header_index, selected_header_index, features)
 
                 source_mel = converter.waveform_to_mel(single_source_waveform).unsqueeze(0)
                 target_mel = converter.waveform_to_mel(single_target_waveform).unsqueeze(0)
@@ -380,6 +388,7 @@ def train_header_bank(speaker_encoder: nn.Module, args) -> None:
                 if len(training_plan) == 0:
                     raise RuntimeError("학습할 header가 없습니다. training_strategy 설정을 확인하세요.")
 
+                training_details = []
                 weighted_losses = []
                 loss_detail_items = []
 
@@ -395,6 +404,7 @@ def train_header_bank(speaker_encoder: nn.Module, args) -> None:
                         lambda_param=args.lambda_param
                     )
 
+                    training_details.append((train_header_index, weight, header_loss.item(), args.training_strategy))
                     weighted_losses.append(header_loss * weight)
                     loss_detail_items.append(f"h{train_header_index}:w{weight:.2f}:loss{header_loss.item():.4f}")
 
@@ -421,8 +431,11 @@ def train_header_bank(speaker_encoder: nn.Module, args) -> None:
                 epoch_loss += loss.item()
                 epoch_updates += 1
                 total_steps += 1
+                training_log.training(epoch + 1, total_steps, metadata,
+                                      selected_header_index, training_details, loss.item())
 
                 if total_steps % args.log_interval == 0:
+                    training_log.summary("progress", epoch + 1)
                     energy = features.get("energy", 0.0)
                     zcr = features.get("zero_crossing_rate", 0.0)
                     centroid = features.get("spectral_centroid", 0.0)
@@ -453,6 +466,7 @@ def train_header_bank(speaker_encoder: nn.Module, args) -> None:
                 "- 논문 기준 실험이라면 --window_size 26400 이상을 사용하세요."
             )
 
+        training_log.summary("epoch-end", epoch + 1)
         avg_loss = epoch_loss / epoch_updates
         print(f"Epoch {epoch + 1}/{args.epochs}, Avg Loss: {avg_loss:.6f}")
 
@@ -475,6 +489,7 @@ def train_header_bank(speaker_encoder: nn.Module, args) -> None:
             print(f"Header Bank가 저장되었습니다: {save_path}")
 
     os.makedirs(args.output_dir, exist_ok=True)
+    training_log.summary("complete")
     final_path = os.path.join(args.output_dir, args.output_name)
     header_bank.save(final_path)
 

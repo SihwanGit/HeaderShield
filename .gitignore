@@ -1,0 +1,52 @@
+# Local datasets and audio (including derivatives)
+/dataset/
+/aihub_dataset/
+/data/*
+!/data/__init__.py
+!/data/dataset.py
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.ogg
+*.pcm
+# Model weights and generated artifacts
+/external/saved_models/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+/output/
+/outputs/
+/analysis/*
+!/analysis/run_vad_alignment.py
+/tmp/
+*.log
+# Environments and caches
+.experiment-deps/
+.experiment-linux-deps/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.matplotlib/
+mpl-cache*/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+# Credentials and private configuration
+.env
+.env.*
+!.env.example
+.aws/
+.ssh/
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+credentials.json
+service-account*.json
+*.p12
+*.pfx

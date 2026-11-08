@@ -1,5 +1,8 @@
 import os
 import argparse
+import hashlib
+import json
+from pathlib import Path
 from typing import Tuple, Optional
 
 import torch
@@ -96,6 +99,7 @@ def apply_header_bank(
     num_headers: int,
     header_length: int,
     selector: RuleBasedHeaderSelector,
+    force_header_index: Optional[int] = None,
 ) -> Tuple[torch.Tensor, int, dict]:
     """
     Header Bank + Selector 방식으로 선택된 header만 적용한다.
@@ -127,9 +131,14 @@ def apply_header_bank(
         waveform.detach().cpu(),
         return_features=True,
     )
+    features["raw_selector_header"] = header_index
 
     if header_index >= header_bank.num_headers:
         header_index = header_bank.num_headers - 1
+    features["selector_header"] = header_index
+    if force_header_index is not None:
+        header_bank._validate_header_index(force_header_index)
+        header_index = force_header_index
 
     perturbed_mel = header_bank.apply_header(mel_spec, header_index)
 
@@ -147,6 +156,10 @@ def protect_header_only(args) -> None:
 
     이 코드는 위 2, 3번을 만들기 위한 header-only 평가용 스크립트이다.
     """
+    if args.mode != "bank" and getattr(args, "force_header_index", None) is not None:
+        raise ValueError("--force_header_index requires --mode bank")
+    # Match Griffin-Lim randomness across forced-header experiments.
+    torch.manual_seed(getattr(args, "seed", 0))
     if args.device == "cuda" and not torch.cuda.is_available():
         print("CUDA를 사용할 수 없습니다. device를 cpu로 변경합니다.")
         args.device = "cpu"
@@ -221,6 +234,7 @@ def protect_header_only(args) -> None:
             num_headers=args.num_headers,
             header_length=args.header_length,
             selector=selector,
+            force_header_index=getattr(args, "force_header_index", None),
         )
 
     else:
@@ -235,6 +249,37 @@ def protect_header_only(args) -> None:
         os.makedirs(output_dir, exist_ok=True)
 
     torchaudio.save(args.output, protected_waveform.cpu(), sr)
+
+    def digest(path):
+        result = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                result.update(chunk)
+        return result.hexdigest()
+
+    model_path = args.header_bank if args.mode == "bank" else args.header
+    metadata = {
+        "schema_version": 2,
+        "dataset_id": getattr(args, "dataset_id", ""),
+        "split": getattr(args, "split", "unspecified"),
+        "mode": args.mode,
+        "selection_mode": ("forced" if getattr(args, "force_header_index", None) is not None else "selector") if args.mode == "bank" else "fixed",
+        "applied_header": selected_header_index,
+        "selector_header": selector_features.get("selector_header") if selector_features else None,
+        "selector_features": selector_features,
+        "source_file": str(Path(args.input).resolve()),
+        "source_sha256": digest(args.input),
+        "protected_sha256": digest(args.output),
+        "checkpoint": str(Path(model_path).resolve()),
+        "checkpoint_sha256": digest(model_path),
+        "sample_rate": sr,
+        "header_length_frames": args.header_length,
+        "application_region": "file_start_only",
+        "settings": vars(args),
+    }
+    metadata_path = Path(str(args.output) + ".json")
+    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"  metadata: {metadata_path}")
 
     print("[Header-only 보호 완료]")
     print(f"  saved_to: {args.output}")
@@ -267,6 +312,12 @@ def main():
                         help="fixed universal header 경로. --mode fixed에서 필요")
     parser.add_argument("--header_bank", type=str, default=None,
                         help="Header Bank 경로. --mode bank에서 필요")
+    parser.add_argument("--force_header_index", type=int, default=None,
+                        help="Selector 대신 지정 헤더를 적용하는 비교 실험. 생략 시 자동 선택")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="파형 복원 난수 seed. 헤더 비교 시 동일하게 유지")
+    parser.add_argument("--dataset_id", default="", help="Dataset identifier for evaluation logs")
+    parser.add_argument("--split", default="unspecified", help="train/validation/test; explicitly record evaluation split")
 
     # 오디오 인자
     parser.add_argument("--sample_rate", type=int, default=16000,

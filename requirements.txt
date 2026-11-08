@@ -1,0 +1,15 @@
+# Install a matching torch/torchaudio pair for your CPU or CUDA environment.
+torch
+torchaudio
+numpy
+scipy
+librosa
+soundfile
+PyYAML
+tqdm
+# RTVC speaker encoder and optional VAD analysis
+webrtcvad-wheels
+scikit-learn
+matplotlib
+umap-learn
+visdom

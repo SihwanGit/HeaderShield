@@ -103,6 +103,7 @@ class VCTKDataset(Dataset):
     def _preprocess_audio(self) -> List[Tuple[torch.Tensor, int]]:
         """오디오를 전처리하고 슬라이딩 윈도우 구간 생성"""
         segments = []
+        self.segment_files = []
 
         for audio_file in self.audio_files:
             # 수정: speaker_id 대신 self.speaker_folder 사용
@@ -143,6 +144,7 @@ class VCTKDataset(Dataset):
             for i in range(0, waveform.shape[1] - self.window_size + 1, self.shift_size):
                 segment = waveform[:, i:i+self.window_size]
                 segments.append((segment, i))
+                self.segment_files.append(os.path.abspath(file_path))
 
         return segments
 
@@ -153,6 +155,8 @@ class VCTKDataset(Dataset):
         segment, position = self.segments[idx]
         return {
             'waveform': segment,
+            'source_file': self.segment_files[idx],
+            'slice_id': idx,
             # 수정: DataLoader collate 안정성을 위해 position을 tensor로 반환
             'position': torch.tensor(position, dtype=torch.long)
         }
@@ -200,6 +204,8 @@ class MultiSpeakerDataset(Dataset):
         return {
             'source_waveform': target_data['waveform'],
             'source_position': target_data['position'],
+            'source_file': target_data['source_file'],
+            'source_slice_id': target_data['slice_id'],
             'target_waveform': other_data['waveform'],
             'target_position': other_data['position'],
             'target_speaker_id': self.other_speaker_id
